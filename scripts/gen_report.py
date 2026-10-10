@@ -389,9 +389,11 @@ function renderTable(recs,isPts){
 
 function render(){
   const isPts = metric==='credits';
-  // 粒度：仅"今天"按小时，其余（全部/近7天/自定义）按天
-  gran = (curFilter==='today') ? 'hour' : 'day';
   const recs = applyFilter(metricRecords());
+  // 粒度：筛选结果只涉及"一天"→ 按小时；跨多天 → 按天。
+  // 对"今天"、自定义单日（起止同一天）都生效；全部/近7天/跨天自定义按天。
+  const daySet = new Set(recs.map(r=>r.d));
+  gran = daySet.size <= 1 ? 'hour' : 'day';
   const agg = aggregate(recs);
   document.getElementById('chartTitle').textContent =
     (gran==='hour' ? '每小时用量' : '每天用量') + '（按模型堆叠）';
