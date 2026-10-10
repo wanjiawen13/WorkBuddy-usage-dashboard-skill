@@ -1,0 +1,7 @@
+# 生成产物（含本机数据，不要提交）
+usage-report.html
+*.html
+
+# Python
+__pycache__/
+*.pyc
