@@ -21,6 +21,7 @@ import json
 import sys
 import os
 import glob
+import re
 from datetime import datetime, timezone, timedelta
 
 HOME = os.path.expanduser("~")
@@ -30,6 +31,40 @@ OUT_NAME = "usage-report.html"
 
 # 本地时区 (UTC+8, 无夏令时)
 TZ = timezone(timedelta(hours=8))
+
+# credit_json 的键是 128-bit ID，前 12 hex = UUIDv7 的 48-bit 毫秒时间戳。
+# 该时间戳需落在此区间才可信；旧格式随机ID解码会溢出或落在遥远未来，判为不可信。
+_U7_MIN = datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp()
+_U7_MAX = datetime(2030, 12, 31, tzinfo=timezone.utc).timestamp()
+_HEX32 = re.compile(r"^[0-9a-f]{32}$")
+
+
+def decode_uuid7(key):
+    """解析 credit_json 键里的 UUIDv7 时间戳（前 12 hex = 毫秒）。命中返回本地时区 datetime，否则 None。"""
+    if not _HEX32.match(key):
+        return None
+    try:
+        ts = int(key[:12], 16) / 1000.0
+        if _U7_MIN <= ts <= _U7_MAX:
+            return datetime.fromtimestamp(ts, tz=TZ)
+    except Exception:
+        return None
+    return None
+
+
+def _model_at_time(gens, dt):
+    """在生成轮次列表 [(epoch, model)] 里找时间最接近 dt 的模型（6h 内）。"""
+    if not gens:
+        return None
+    target = dt.timestamp()
+    best, best_d = None, None
+    for epoch, m in gens:
+        d = abs(epoch - target)
+        if best_d is None or d < best_d:
+            best_d, best = d, m
+    if best_d is not None and best_d <= 6 * 3600:
+        return best
+    return None
 
 
 def norm_model(m):
@@ -43,15 +78,18 @@ def norm_model(m):
 
 
 def load_credits(db_path, traces_by_session):
-    """    WorkBuddy 积分：每个会话 credit_json 求和，并按该会话的 trace 活跃时间摊到各小时。
+    """WorkBuddy 积分：每个会话 credit_json 求和。
 
-    重要：session_usage.updated_at 只是"最后同步时刻"，无法反映真实消耗时间，
-    会把整天的量压到一个小时。故改用该会话的运行 trace 时间（按 token 加权）把会话
-    积分摊分到各小时。
+    时间归属（核心修正）：credit_json 的键是 UUIDv7，前 12 hex = 该条目消费时刻的
+    毫秒时间戳，可精确到条目级。优先用它把每笔积分归入真实消费时间；旧格式随机ID
+    （解码越界/溢出）或没有可信时间的条目才回退。
 
-    模型归因：sessions.model 只记"会话选的主模型"，WorkBuddy 升级后实际请求可能
-    被路由到其他模型（如选 gpt-5.6-terra 实际走 deepseek-v4.1-flash）。因此有 trace
-    的会话按每轮 generation 的实际模型与 token 占比摊分；无 trace 才回退会话主模型。
+    模型归因：sessions.model 只记"会话选的主模型"，实际请求可能被路由到其他模型。
+    因此按条目的 UUIDv7 时间匹配同会话最近的 trace 生成轮次（实际模型）；无匹配时
+    用会话 trace 的多数模型，再回退会话主模型。
+
+    回退路径（旧格式会话/无 trace）：沿用 trace token 加权摊分到各小时；无 trace 才
+    回退 updated_at。
     """
     if not os.path.exists(db_path):
         print("WARN: db 不存在:", db_path)
@@ -67,6 +105,13 @@ def load_credits(db_path, traces_by_session):
     """).fetchall()
     conn.close()
 
+    # 每会话按时间排序的 (epoch, model)，用于"条目时间 -> 实际模型"匹配
+    gens_by_session = {}
+    for sid, trs in traces_by_session.items():
+        gens_by_session[sid] = sorted(
+            ((t["epoch"], t.get("model") or "") for t in trs if t.get("tok", 0) > 0),
+            key=lambda x: x[0])
+
     out = []
     for r in rows:
         credits = 0.0
@@ -77,34 +122,63 @@ def load_credits(db_path, traces_by_session):
                 credits = 0.0
         if credits <= 0:
             continue
-        model = norm_model(r["model"])
+        sid = r["sid"]
+        model0 = norm_model(r["model"])
         title = (r["title"] or "(无标题)")
-        traces = [t for t in (traces_by_session.get(r["sid"]) or []) if t.get("tok", 0) > 0]
-        upd_s = (r["upd"] or 0) / 1000.0
-        # 时效守卫：credit_json 是会话累计快照。若该会话的全部 trace 都远早于
-        # 最后同步时刻（相差 >24h），说明积分是跨天之后才同步上来的（如长会话
-        # 几天后再次打开）。此时按 trace 摊分会把新积分错误摊回历史时段，
-        # 故放弃摊分，回退到 updated_at 归桶。
-        if traces and upd_s - max(t["epoch"] for t in traces) > 86400:
-            traces = []
-        if traces:
-            wsum = sum(t["tok"] for t in traces)
-            for t in traces:
-                share = credits * (t["tok"] / wsum) if wsum > 0 else credits / len(traces)
-                out.append({
-                    "ts": t["ts"], "d": t["d"], "h": t["h"],
-                    "model": t.get("model") or model,
-                    "value": round(share, 4), "label": title,
-                })
-        else:
-            ts = (r["upd"] or 0) / 1000.0
-            dt = datetime.fromtimestamp(ts, tz=TZ)
+        gens = gens_by_session.get(sid) or []
+        dom_model = None
+        if gens:
+            mc = {}
+            for _, m in gens:
+                if m:
+                    mc[m] = mc.get(m, 0) + 1
+            if mc:
+                dom_model = sorted(mc.items(), key=lambda kv: -kv[1])[0][0]
+
+        # 拆分：可信 UUIDv7 时间条目 vs 不可信（旧格式/溢出）条目
+        valid, legacy_val = [], 0.0
+        try:
+            cj = json.loads(r["cj"])
+        except Exception:
+            cj = {}
+        for k, v in cj.items():
+            dt = decode_uuid7(k)
+            if dt is not None:
+                valid.append((dt, float(v)))
+            else:
+                legacy_val += float(v)
+
+        def emit(dt, model, value):
             out.append({
                 "ts": dt.strftime("%Y-%m-%d %H:%M:%S"),
                 "d": dt.strftime("%Y-%m-%d"),
                 "h": dt.strftime("%Y-%m-%d %H:00"),
-                "model": model, "value": round(credits, 4), "label": title,
+                "model": model, "value": round(value, 4), "label": title,
             })
+
+        if valid:
+            for dt, v in valid:
+                emit(dt, _model_at_time(gens, dt) or dom_model or model0, v)
+            if legacy_val > 0:
+                upd_dt = datetime.fromtimestamp((r["upd"] or 0) / 1000.0, tz=TZ)
+                emit(upd_dt, dom_model or model0, legacy_val)
+        else:
+            # 旧格式会话：沿用 trace token 加权摊分（带 24h 时效守卫），无 trace 回退 updated_at
+            traces = [t for t in (traces_by_session.get(sid) or []) if t.get("tok", 0) > 0]
+            upd_s = (r["upd"] or 0) / 1000.0
+            if traces and upd_s - max(t["epoch"] for t in traces) > 86400:
+                traces = []
+            if traces:
+                wsum = sum(t["tok"] for t in traces)
+                for t in traces:
+                    share = credits * (t["tok"] / wsum) if wsum > 0 else credits / len(traces)
+                    out.append({
+                        "ts": t["ts"], "d": t["d"], "h": t["h"],
+                        "model": t.get("model") or model0,
+                        "value": round(share, 4), "label": title,
+                    })
+            else:
+                emit(datetime.fromtimestamp(upd_s, tz=TZ), model0, credits)
     out.sort(key=lambda x: x["ts"])
     return out
 
@@ -499,7 +573,7 @@ function render(){
   document.getElementById('chartTitle').textContent =
     (gran==='hour' ? '每小时用量' : '每天用量') + '（按模型堆叠）';
   document.getElementById('hint').textContent = (isPts
-    ? '指标：WorkBuddy 积分（来自会话消耗记录）。按该会话各 trace 生成轮次的实际模型与 token 占比，把会话积分摊分到对应时间与模型；无 trace 的会话回退到会话主模型与最后同步时刻。'
+    ? '指标：WorkBuddy 积分（来自会话消耗记录）。每笔积分用 credit_json 键内的 UUIDv7 时间戳归入真实消费时刻，模型按该时刻匹配同会话最近的实际调用模型；旧格式/无 trace 的会话回退到 trace 加权或最后同步时刻。'
     : '指标：Token 消耗（来自运行 trace，输入+输出，缓存单列）。按 trace 开始时刻归入对应时间桶。')
     + (gran==='hour' ? ' 当前粒度：小时。' : ' 当前粒度：天。');
   renderSummary();
@@ -525,8 +599,8 @@ document.querySelectorAll('.tabs button').forEach(b=>{
 document.getElementById('foot').innerHTML =
   '口径说明：① WorkBuddy 积分 = 会话消耗记录(session_usage.credit_json)各项之和，单位积分(两位小数)；'
   +'② Token 消耗 = 运行 trace 的输入+输出 token，缓存 token 单列展示；'
-  +'③ 两者来源与粒度不同（积分按会话、Token 按 trace），仅供并列参考。本报表为本地只读分析，不修改原始数据。'
-  +'④ 已知限制：本地 traces 自 2026-10-11 15:46 起停写，Token 数据仅覆盖至该日；此后（含今天）Token 为空是<strong>源数据断供</strong>，非计算错误，积分视图不受影响。';
+  +  '③ 两者来源与粒度不同（积分按会话条目、Token 按 trace），仅供并列参考。本报表为本地只读分析，不修改原始数据。'
+  +'④ 口径：积分时间来自 credit_json 键内 UUIDv7 时间戳（精确到条目）；旧格式随机ID/无 trace 会话回退 trace 加权或最后同步时刻，可能高估同步当天。Token 来自本地 traces（JSON/JSONL 双格式）。';
 
 render();
 </script>
