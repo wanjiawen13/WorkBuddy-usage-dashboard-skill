@@ -9,7 +9,7 @@ agent_created: true
 ## Overview
 读取 WorkBuddy 本地数据，按"小时 × 模型"聚合**两个并列指标**并生成一个自包含 HTML 报表：
 1. **WorkBuddy 积分** —— 套餐积分体系的消耗（来自 `workbuddy.db` 的 `session_usage.credit_json`）。
-2. **Token 消耗** —— 运行 trace 的输入/输出/缓存 token（来自 `traces/*/trace_*.json`）。
+2. **Token 消耗** —— 运行 trace 的输入/输出/缓存 token（来自 `traces/*/trace_*.json` 与升级后的 `trace_*.jsonl` 事件流，脚本均兼容）。
 
 报表含 KPI 卡片、堆叠柱状图、模型排行、可排序明细表与时间筛选。
 

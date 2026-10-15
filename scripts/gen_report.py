@@ -76,6 +76,13 @@ def load_credits(db_path, traces_by_session):
         model = norm_model(r["model"])
         title = (r["title"] or "(无标题)")
         traces = [t for t in (traces_by_session.get(r["sid"]) or []) if t.get("tok", 0) > 0]
+        upd_s = (r["upd"] or 0) / 1000.0
+        # 时效守卫：credit_json 是会话累计快照。若该会话的全部 trace 都远早于
+        # 最后同步时刻（相差 >24h），说明积分是跨天之后才同步上来的（如长会话
+        # 几天后再次打开）。此时按 trace 摊分会把新积分错误摊回历史时段，
+        # 故放弃摊分，回退到 updated_at 归桶。
+        if traces and upd_s - max(t["epoch"] for t in traces) > 86400:
+            traces = []
         if traces:
             wsum = sum(t["tok"] for t in traces)
             for t in traces:
@@ -97,55 +104,144 @@ def load_credits(db_path, traces_by_session):
     return out
 
 
+def _parse_json(j):
+    """解析旧版 trace_<id>.json（单对象 {trace, spans}）。返回统一的 trace 描述字典。"""
+    t = j.get("trace") or {}
+    started = t.get("startedAt")
+    sid = t.get("sessionId")
+    name = t.get("name")
+    mi = t.get("modelInfo") or {}
+    inp = int(mi.get("totalInputTokens") or 0)
+    outp = int(mi.get("totalOutputTokens") or 0)
+    cached = int(mi.get("totalCachedTokens") or 0)
+    total = int(t.get("totalTokens") or (inp + outp))
+    models = [norm_model(m) for m in (mi.get("models") or [])]
+    n = len(models) or 1
+    generations = []
+    for m in models:
+        generations.append({
+            "model": m, "inp": inp / n, "outp": outp / n,
+            "cached": cached / n, "total": total / n, "ts": started,
+        })
+    return {"startedAt": started, "sessionId": sid, "name": name, "generations": generations}
+
+
+def _parse_jsonl(path):
+    """解析新版 trace_<id>.jsonl（事件流，每行一个事件）。
+    模型/token 在 generation span 的 toolOutput（原始 API 响应）里。
+    """
+    started = None
+    sid = None
+    name = None
+    generations = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                ty = o.get("type")
+                if ty in ("trace_start", "trace_update"):
+                    tr = o.get("trace") or {}
+                    if started is None:
+                        started = tr.get("startedAt")
+                    sid = tr.get("sessionId") or sid
+                    name = tr.get("name") or name
+                elif ty == "span_end":
+                    sp = o.get("span") or {}
+                    if sp.get("type") != "generation":
+                        continue
+                    gts = sp.get("startedAt")
+                    out = sp.get("toolOutput")
+                    if not out:
+                        continue
+                    try:
+                        arr = json.loads(out)
+                    except Exception:
+                        continue
+                    items = arr if isinstance(arr, list) else [arr]
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        model = norm_model(item.get("model"))
+                        us = item.get("usage") or {}
+                        inp = int(us.get("prompt_tokens") or 0)
+                        outp = int(us.get("completion_tokens") or 0)
+                        total = int(us.get("total_tokens") or (inp + outp))
+                        pd = us.get("prompt_tokens_details") or {}
+                        cd = us.get("completion_tokens_details") or {}
+                        cached = int(pd.get("cached_tokens") or 0) + int(cd.get("cached_tokens") or 0)
+                        if model and total > 0:
+                            generations.append({
+                                "model": model, "inp": inp, "outp": outp,
+                                "cached": cached, "total": total, "ts": gts,
+                            })
+    except Exception:
+        pass
+    return {"startedAt": started, "sessionId": sid, "name": name, "generations": generations}
+
+
 def scan_traces(traces_dir):
     """扫描 traces 目录：返回 (token 记录列表, session_id -> trace 时间/权重 索引)。
 
+    兼容两种 trace 格式：
+      - 旧版 trace_<id>.json（单对象 {trace, spans}，模型/token 在 trace.modelInfo）
+      - 新版 trace_<id>.jsonl（事件流；模型/token 在 generation span 的 toolOutput）
     token 记录用于 Token 指标；session 索引用于把会话积分按活跃时间摊分。
     """
     if not os.path.isdir(traces_dir):
         print("WARN: traces 目录不存在:", traces_dir)
         return [], {}
     files = glob.glob(os.path.join(traces_dir, "*", "*.json"))
+    files += glob.glob(os.path.join(traces_dir, "*", "*.jsonl"))
     token_records = []
     by_session = {}
     for f in files:
         try:
-            j = json.load(open(f, encoding="utf-8"))
+            if f.endswith(".jsonl"):
+                parsed = _parse_jsonl(f)
+            else:
+                parsed = _parse_json(json.load(open(f, encoding="utf-8")))
         except Exception:
             continue
-        t = j.get("trace") or {}
-        started = t.get("startedAt")
+        started = parsed.get("startedAt")
         if not started:
             continue
         try:
             dt = datetime.fromisoformat(started.replace("Z", "+00:00")).astimezone(TZ)
         except Exception:
             continue
-        mi = t.get("modelInfo") or {}
-        inp = int(mi.get("totalInputTokens") or 0)
-        outp = int(mi.get("totalOutputTokens") or 0)
-        cached = int(mi.get("totalCachedTokens") or 0)
-        total = int(t.get("totalTokens") or (inp + outp))
         ts = dt.strftime("%Y-%m-%d %H:%M:%S")
         hh = dt.strftime("%Y-%m-%d %H:00")
         dd = dt.strftime("%Y-%m-%d")
 
-        sid = t.get("sessionId")
-        if sid:
-            by_session.setdefault(sid, []).append({"ts": ts, "d": dd, "h": hh, "tok": total})
-
-        models = [norm_model(m) for m in (mi.get("models") or [])]
-        if not models:
-            continue
-        n = len(models)  # 多模型 trace 极少，按模型数量均分
-        label = (t.get("name") or "trace")
-        for m in models:
+        sid = parsed.get("sessionId")
+        label = parsed.get("name") or "trace"
+        for g in parsed.get("generations", []):
+            gts = g.get("ts") or ts
+            try:
+                gdt = datetime.fromisoformat(gts.replace("Z", "+00:00")).astimezone(TZ)
+                g_ts = gdt.strftime("%Y-%m-%d %H:%M:%S")
+                g_hh = gdt.strftime("%Y-%m-%d %H:00")
+                g_dd = gdt.strftime("%Y-%m-%d")
+                g_epoch = gdt.timestamp()
+            except Exception:
+                g_ts, g_hh, g_dd, g_epoch = ts, hh, dd, dt.timestamp()
+            if sid:
+                by_session.setdefault(sid, []).append({
+                    "ts": g_ts, "d": g_dd, "h": g_hh, "tok": float(g["total"]),
+                    "epoch": g_epoch,
+                })
             token_records.append({
-                "ts": ts, "d": dd, "h": hh, "model": m,
-                "value": round(total / n, 2),
-                "input": round(inp / n, 2),
-                "output": round(outp / n, 2),
-                "cached": round(cached / n, 2),
+                "ts": g_ts, "d": g_dd, "h": g_hh, "model": g["model"],
+                "value": round(g["total"], 2),
+                "input": round(g["inp"], 2),
+                "output": round(g["outp"], 2),
+                "cached": round(g["cached"], 2),
                 "label": label,
             })
     token_records.sort(key=lambda x: x["ts"])
@@ -424,7 +520,8 @@ document.querySelectorAll('.tabs button').forEach(b=>{
 document.getElementById('foot').innerHTML =
   '口径说明：① WorkBuddy 积分 = 会话消耗记录(session_usage.credit_json)各项之和，单位积分(两位小数)；'
   +'② Token 消耗 = 运行 trace 的输入+输出 token，缓存 token 单列展示；'
-  +'③ 两者来源与粒度不同（积分按会话、Token 按 trace），仅供并列参考。本报表为本地只读分析，不修改原始数据。';
+  +'③ 两者来源与粒度不同（积分按会话、Token 按 trace），仅供并列参考。本报表为本地只读分析，不修改原始数据。'
+  +'④ 已知限制：本地 traces 自 2026-10-11 15:46 起停写，Token 数据仅覆盖至该日；此后（含今天）Token 为空是<strong>源数据断供</strong>，非计算错误，积分视图不受影响。';
 
 render();
 </script>

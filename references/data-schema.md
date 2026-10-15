@@ -22,6 +22,9 @@
 ### 口径
 - 会话积分 = `sum(credit_json.values())`；模型 = `sessions.model`（会话级）。
 - **每小时归桶（v3 修正）**：`session_usage.updated_at` 只是会话用量"最后同步时刻"，会把跨多天的会话全天量压到一个小时。故改用该会话在 `traces/` 中的各 trace 活跃时间，按 trace `totalTokens` 占比把会话积分**摊分到对应小时**；无 trace 的会话回退到 `updated_at`。模型仍取会话主模型。
+- **时效守卫（v4 修正，2026-10-14）**：`credit_json` 是会话累计快照。若该会话全部 trace 都远早于 `updated_at`（相差 >24h，典型：长会话几天后再次打开、积分才同步上来），按 trace 摊分会把新积分错误摊回历史时段（实测：10-10 会话累计 583.91 被摊回 10-10，导致 10-14 当天只剩 34.04）。此时放弃摊分、回退到 `updated_at` 归桶。注意该回退会**高估**同步当天、**低估**真实消耗日——`credit_json` 无时间维度，跨天会话的积分本地无法精确拆天。
+- **积分同步有延迟**：活跃会话的 `credit_json` 可能长时间为空/为 0（实测当前会话 0.00），"今天"的积分在会话结束后才逐步补齐，当天数字偏小是常态。
+- **traces 断供（2026-10-11 起）**：`traces/` 最新文件停在 10-11 15:46，之后无新 trace 写入（疑似 WorkBuddy 更新后改了存储位置或停止写本地 trace）。影响：①Token 指标此后无数据；②新会话积分全部走 `updated_at` 回退路径。待排查新位置。
 - 单位：积分，两位小数。
 - 校验：全量求和 ≈ 截图"平台奖励积分 已使用"数值（截至 2026-10-09 约 5,331.78）。
 
@@ -34,19 +37,18 @@
 ## 指标二：Token 消耗（运行 trace）
 
 ### 数据源
-`~/.workbuddy/traces/<pid>/trace_*.json`（每个 agent 工作流一轮一个文件，约 900+ 个）
+`~/.workbuddy/traces/<pid>/trace_*`（每个 agent 工作流一轮一个文件）。WorkBuddy 升级后**格式变了**，脚本两种都支持：
+- **旧版** `trace_<id>.json`：单个 JSON 对象 `{trace, spans}`，模型/token 在 `trace.modelInfo`。约 2026-10-11 15:46 之后不再产生。
+- **新版** `trace_<id>.jsonl`：JSON Lines 事件流（每行一个事件），约 2026-10-11 之后开始产生。数据仍在、只是换了扩展名+结构，**不是停写**。
 
-### 关键字段（`trace` 对象）
-- `startedAt` / `endedAt` —— ISO 时间（UTC，带 Z）
-- `sessionId`、`agentName`、`name`
-- `totalTokens` —— 输入+输出
-- `modelInfo.models` —— 本轮用到的模型名数组
-- `modelInfo.totalInputTokens` / `totalOutputTokens` / `totalCachedTokens` —— token 明细
+### 关键字段
+- **旧版**：`trace.startedAt`(ISO UTC,Z) / `sessionId` / `totalTokens` / `modelInfo.{models, totalInputTokens, totalOutputTokens, totalCachedTokens}`。
+- **新版**：`trace_start` / `trace_update` 事件的 `trace` 对象含 `startedAt` / `sessionId`；模型与 token 在 **`generation` 类型 span 的 `toolOutput`**（原始 API 响应字符串）里：`usage.{prompt_tokens, completion_tokens, total_tokens, prompt_tokens_details.cached_tokens, completion_tokens_details.cached_tokens}`，`model` 也在其中。
 
 ### 口径
-- 每条 trace 的 token = 输入+输出（`totalTokens`）；缓存 token 单列展示。
-- 模型取 `modelInfo.models`；多模型 trace 极少，按模型数量均分。
-- 每小时：按 `startedAt` 转本地时区(+8) 归桶。
+- token = 输入+输出；缓存 token 单列展示。
+- 旧版：模型取 `modelInfo.models`（多模型按数量均分）。新版：逐条 `generation` span 取其 `model` + `usage.total_tokens` 聚合。
+- 每小时：按 trace `startedAt`（新版按各 `generation` span 的 `startedAt`）转本地时区(+8) 归桶。
 - 单位：整数 token。
 
 ### 展示粒度
