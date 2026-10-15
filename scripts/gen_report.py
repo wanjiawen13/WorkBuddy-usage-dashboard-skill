@@ -43,11 +43,15 @@ def norm_model(m):
 
 
 def load_credits(db_path, traces_by_session):
-    """WorkBuddy 积分：每个会话 credit_json 求和，并按该会话的 trace 活跃时间摊到各小时。
+    """    WorkBuddy 积分：每个会话 credit_json 求和，并按该会话的 trace 活跃时间摊到各小时。
 
     重要：session_usage.updated_at 只是"最后同步时刻"，无法反映真实消耗时间，
     会把整天的量压到一个小时。故改用该会话的运行 trace 时间（按 token 加权）把会话
-    积分摊分到各小时；模型仍取 sessions.model（会话级口径不变）。
+    积分摊分到各小时。
+
+    模型归因：sessions.model 只记"会话选的主模型"，WorkBuddy 升级后实际请求可能
+    被路由到其他模型（如选 gpt-5.6-terra 实际走 deepseek-v4.1-flash）。因此有 trace
+    的会话按每轮 generation 的实际模型与 token 占比摊分；无 trace 才回退会话主模型。
     """
     if not os.path.exists(db_path):
         print("WARN: db 不存在:", db_path)
@@ -89,7 +93,8 @@ def load_credits(db_path, traces_by_session):
                 share = credits * (t["tok"] / wsum) if wsum > 0 else credits / len(traces)
                 out.append({
                     "ts": t["ts"], "d": t["d"], "h": t["h"],
-                    "model": model, "value": round(share, 4), "label": title,
+                    "model": t.get("model") or model,
+                    "value": round(share, 4), "label": title,
                 })
         else:
             ts = (r["upd"] or 0) / 1000.0
@@ -234,7 +239,7 @@ def scan_traces(traces_dir):
             if sid:
                 by_session.setdefault(sid, []).append({
                     "ts": g_ts, "d": g_dd, "h": g_hh, "tok": float(g["total"]),
-                    "epoch": g_epoch,
+                    "model": g["model"], "epoch": g_epoch,
                 })
             token_records.append({
                 "ts": g_ts, "d": g_dd, "h": g_hh, "model": g["model"],
@@ -494,7 +499,7 @@ function render(){
   document.getElementById('chartTitle').textContent =
     (gran==='hour' ? '每小时用量' : '每天用量') + '（按模型堆叠）';
   document.getElementById('hint').textContent = (isPts
-    ? '指标：WorkBuddy 积分（来自会话消耗记录）。按该会话各 trace 的 token 占比把会话积分摊分到对应时间；“每个模型”取会话主模型。无 trace 的会话回退到会话最后同步时刻。'
+    ? '指标：WorkBuddy 积分（来自会话消耗记录）。按该会话各 trace 生成轮次的实际模型与 token 占比，把会话积分摊分到对应时间与模型；无 trace 的会话回退到会话主模型与最后同步时刻。'
     : '指标：Token 消耗（来自运行 trace，输入+输出，缓存单列）。按 trace 开始时刻归入对应时间桶。')
     + (gran==='hour' ? ' 当前粒度：小时。' : ' 当前粒度：天。');
   renderSummary();

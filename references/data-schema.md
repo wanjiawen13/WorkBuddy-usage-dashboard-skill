@@ -20,11 +20,12 @@
 - `id`（= session_usage.session_id）、`model`（会话主模型）、`title`、`created_at`
 
 ### 口径
-- 会话积分 = `sum(credit_json.values())`；模型 = `sessions.model`（会话级）。
-- **每小时归桶（v3 修正）**：`session_usage.updated_at` 只是会话用量"最后同步时刻"，会把跨多天的会话全天量压到一个小时。故改用该会话在 `traces/` 中的各 trace 活跃时间，按 trace `totalTokens` 占比把会话积分**摊分到对应小时**；无 trace 的会话回退到 `updated_at`。模型仍取会话主模型。
+- 会话积分 = `sum(credit_json.values())`。
+- **每小时归桶（v3 修正）**：`session_usage.updated_at` 只是会话用量"最后同步时刻"，会把跨多天的会话全天量压到一个小时。故改用该会话在 `traces/` 中的各 trace 活跃时间，按 trace `totalTokens` 占比把会话积分**摊分到对应小时**；无 trace 的会话回退到 `updated_at`。
+- **模型归因（v3.3 修正，2026-10-15）**：`sessions.model` 只记"会话选的主模型"，WorkBuddy 升级后实际请求可能被路由到其他模型（实测：10-14 会话选 gpt-5.6-terra，trace 实际全为 deepseek-v4.1-flash / glm-5.3-flash，若按主模型归因会把 641 积分错记到 gpt-5.6-terra）。故有 trace 的会话按每轮 generation 的**实际模型**与 token 占比摊分积分到"时间 × 模型"；无 trace 的会话才回退会话主模型。
 - **时效守卫（v4 修正，2026-10-14）**：`credit_json` 是会话累计快照。若该会话全部 trace 都远早于 `updated_at`（相差 >24h，典型：长会话几天后再次打开、积分才同步上来），按 trace 摊分会把新积分错误摊回历史时段（实测：10-10 会话累计 583.91 被摊回 10-10，导致 10-14 当天只剩 34.04）。此时放弃摊分、回退到 `updated_at` 归桶。注意该回退会**高估**同步当天、**低估**真实消耗日——`credit_json` 无时间维度，跨天会话的积分本地无法精确拆天。
 - **积分同步有延迟**：活跃会话的 `credit_json` 可能长时间为空/为 0（实测当前会话 0.00），"今天"的积分在会话结束后才逐步补齐，当天数字偏小是常态。
-- **traces 断供（2026-10-11 起）**：`traces/` 最新文件停在 10-11 15:46，之后无新 trace 写入（疑似 WorkBuddy 更新后改了存储位置或停止写本地 trace）。影响：①Token 指标此后无数据；②新会话积分全部走 `updated_at` 回退路径。待排查新位置。
+- **traces 格式变更（2026-10-11 15:46 起，v3.2 修正）**：并非断供。WorkBuddy 升级后 trace 从 `trace_*.json`（单对象）改为 `trace_*.jsonl`（事件流），模型/token 移到 generation span 的 `toolOutput`；脚本已双格式兼容。
 - 单位：积分，两位小数。
 - 校验：全量求和 ≈ 截图"平台奖励积分 已使用"数值（截至 2026-10-09 约 5,331.78）。
 

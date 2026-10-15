@@ -33,7 +33,7 @@ agent_created: true
    脚本零依赖（仅 Python 标准库），用任意 Python 3 即可；在 WorkBuddy 内置终端可直接 `python gen_report.py`。
 2. **展示结果**：用 `present_files` 打开生成的 `usage-report.html`，并附一句概要（积分合计 + token 合计 + 各自 Top 模型）。
 3. **口径说明**（回复用户时必带）：
-   - 积分：会话消耗记录 `credit_json` 各项之和；按该会话各 trace 的 token 占比把会话积分**摊分到对应小时**（因为 `session_usage.updated_at` 只是最后同步时刻，会把整天的量压到一个小时）；"每个模型"取会话主模型；无 trace 的会话回退到 `updated_at`。
+   - 积分：会话消耗记录 `credit_json` 各项之和；按该会话各 trace 生成轮次的时间与 token 占比，把会话积分**摊分到对应小时与实际模型**（`session_usage.updated_at` 只是最后同步时刻，会把整天的量压到一个小时；`sessions.model` 只记会话选的主模型，实际请求可能被路由到其他模型，如选 gpt-5.6-terra 实际走 deepseek-v4.1-flash）；无 trace 的会话回退到会话主模型 + `updated_at`。
    - Token：trace 的输入+输出（缓存单列）；每小时按 trace 开始时刻归桶。
    - **时间粒度**：筛选结果只涉及**一天**时（"今天"，或自定义起止同一天）按**小时**展示；跨多天时按**天**展示（避免几百根小时柱）。
 
@@ -46,5 +46,5 @@ agent_created: true
 
 ## Notes
 - 只读分析，绝不修改 `workbuddy.db` 或 traces。
-- 积分来源 `session_usage.credit_json` 的键是哈希，无法解析到模型；按模型拆分依赖 `sessions.model`（会话级）。
+- 积分来源 `session_usage.credit_json` 的键是哈希，无法解析到模型；按模型拆分依赖该会话 trace 里每轮 generation 的实际模型（token 占比摊分），仅无 trace 时回退 `sessions.model`。
 - token 来源为 `traces/` 目录，保留期有限（约 1 个月），更早的数据可能已被清理。
