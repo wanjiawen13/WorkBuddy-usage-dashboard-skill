@@ -38,6 +38,19 @@ _U7_MIN = datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp()
 _U7_MAX = datetime(2030, 12, 31, tzinfo=timezone.utc).timestamp()
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 
+# 免费/自有模型：不消耗 WorkBuddy 积分，积分归属时必须排除，否则会把积分错记到这些模型上。
+# 用户确认：deepseek-v4-flash（无 .1）是自有模型不计费；deepseek-v4.1-flash（带 .1）计费。
+# 如需扩展，在此集合追加（归一化后的模型名，不含 custom-local: 前缀）。
+FREE_MODELS = {"deepseek-v4-flash"}
+
+
+def _paid(m):
+    """返回计费模型名；若为免费模型或空则返回 None。"""
+    m = norm_model(m)
+    if m in FREE_MODELS or m == "未指定":
+        return None
+    return m
+
 
 def decode_uuid7(key):
     """解析 credit_json 键里的 UUIDv7 时间戳（前 12 hex = 毫秒）。命中返回本地时区 datetime，否则 None。"""
@@ -53,12 +66,15 @@ def decode_uuid7(key):
 
 
 def _model_at_time(gens, dt):
-    """在生成轮次列表 [(epoch, model)] 里找时间最接近 dt 的模型（6h 内）。"""
+    """在生成轮次列表 [(epoch, model)] 里找时间最接近 dt 的【计费】模型（6h 内）。
+    免费模型（FREE_MODELS）一律跳过，避免把积分错记到不计费的模型上。"""
     if not gens:
         return None
     target = dt.timestamp()
     best, best_d = None, None
     for epoch, m in gens:
+        if m in FREE_MODELS:
+            continue
         d = abs(epoch - target)
         if best_d is None or d < best_d:
             best_d, best = d, m
@@ -123,15 +139,16 @@ def load_credits(db_path, traces_by_session):
         if credits <= 0:
             continue
         sid = r["sid"]
-        model0 = norm_model(r["model"])
+        model0 = _paid(r["model"]) or "未指定"
         title = (r["title"] or "(无标题)")
         gens = gens_by_session.get(sid) or []
         dom_model = None
         if gens:
             mc = {}
             for _, m in gens:
-                if m:
-                    mc[m] = mc.get(m, 0) + 1
+                pm = _paid(m)
+                if pm:
+                    mc[pm] = mc.get(pm, 0) + 1
             if mc:
                 dom_model = sorted(mc.items(), key=lambda kv: -kv[1])[0][0]
 
@@ -153,7 +170,7 @@ def load_credits(db_path, traces_by_session):
                 "ts": dt.strftime("%Y-%m-%d %H:%M:%S"),
                 "d": dt.strftime("%Y-%m-%d"),
                 "h": dt.strftime("%Y-%m-%d %H:00"),
-                "model": model, "value": round(value, 4), "label": title,
+                "model": _paid(model) or "未指定", "value": round(value, 4), "label": title,
             })
 
         if valid:
@@ -174,7 +191,7 @@ def load_credits(db_path, traces_by_session):
                     share = credits * (t["tok"] / wsum) if wsum > 0 else credits / len(traces)
                     out.append({
                         "ts": t["ts"], "d": t["d"], "h": t["h"],
-                        "model": t.get("model") or model0,
+                        "model": _paid(t.get("model")) or model0,
                         "value": round(share, 4), "label": title,
                     })
             else:
@@ -573,7 +590,7 @@ function render(){
   document.getElementById('chartTitle').textContent =
     (gran==='hour' ? '每小时用量' : '每天用量') + '（按模型堆叠）';
   document.getElementById('hint').textContent = (isPts
-    ? '指标：WorkBuddy 积分（来自会话消耗记录）。每笔积分用 credit_json 键内的 UUIDv7 时间戳归入真实消费时刻，模型按该时刻匹配同会话最近的实际调用模型；旧格式/无 trace 的会话回退到 trace 加权或最后同步时刻。'
+    ? '指标：WorkBuddy 积分（来自会话消耗记录）。每笔积分用 credit_json 键内的 UUIDv7 时间戳归入真实消费时刻，模型按该时刻匹配同会话最近的【计费】模型；免费/自有模型（如 deepseek-v4-flash）不计入、已排除；无匹配时归"未指定"。'
     : '指标：Token 消耗（来自运行 trace，输入+输出，缓存单列）。按 trace 开始时刻归入对应时间桶。')
     + (gran==='hour' ? ' 当前粒度：小时。' : ' 当前粒度：天。');
   renderSummary();

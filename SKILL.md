@@ -33,7 +33,7 @@ agent_created: true
    脚本零依赖（仅 Python 标准库），用任意 Python 3 即可；在 WorkBuddy 内置终端可直接 `python gen_report.py`。
 2. **展示结果**：用 `present_files` 打开生成的 `usage-report.html`，并附一句概要（积分合计 + token 合计 + 各自 Top 模型）。
 3. **口径说明**（回复用户时必带）：
-   - 积分：会话消耗记录 `credit_json` 各项之和；**`credit_json` 的键是 UUIDv7，前 12 hex = 每笔积分的消费毫秒时间戳**，逐条解码归入真实消费时间（精确到条目级）；模型按该条目时间匹配同会话最近的 trace 实际调用模型。旧格式键（约 2025-09-24 前）与无 trace 的会话才回退 trace token 加权或 `updated_at`。`sessions.model` 只是会话选的主模型，不能用于归因（实测选 gpt-5.6-terra 实际走 deepseek-v4.1-flash）。
+   - 积分：会话消耗记录 `credit_json` 各项之和；**`credit_json` 的键是 UUIDv7，前 12 hex = 每笔积分的消费毫秒时间戳**，逐条解码归入真实消费时间（精确到条目级）；模型按该条目时间匹配同会话最近的【计费】模型。免费/自有模型（如 `deepseek-v4-flash`，注意与计费的 `deepseek-v4.1-flash` 区分）在 `FREE_MODELS` 中排除，绝不记入积分；无法判定计费模型的条目归"未指定"。旧格式键（约 2025-09-24 前）与无 trace 的会话才回退 trace token 加权或 `updated_at`。`sessions.model` 只是会话选的主模型，不能用于归因。
    - Token：trace 的输入+输出（缓存单列）；每小时按 trace 开始时刻归桶。
    - **时间粒度**：筛选结果只涉及**一天**时（"今天"，或自定义起止同一天）按**小时**展示；跨多天时按**天**展示（避免几百根小时柱）。
 
