@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WorkBuddy 用量报表生成器 (v2)
+WorkBuddy 用量报表生成器 (v4.2)
 
 并列展示两个指标：
   1) WorkBuddy 积分   —— 来自 workbuddy.db 的 session_usage.credit_json（每会话积分）
-  2) Token 消耗       —— 来自 traces/*/trace_*.json（每轮 trace 的输入/输出/缓存 token + 模型 + 时间）
+  2) Token 消耗       —— 来自 traces/*/trace_*.json 与 trace_*.jsonl（输入/输出/缓存 token + 模型 + 时间）
+
+积分记录带 est(时间可信度) 与 src(模型归因来源) 标记；
+无法可靠归时的积分仍计入总额，但报表显式提示，不伪装成当天真实消耗。
 
 按"小时 × 模型"聚合，生成自包含 usage-report.html（堆叠柱状图 + KPI + 模型排行 + 明细表 + 时间筛选）。
 
@@ -22,6 +25,7 @@ import sys
 import os
 import glob
 import re
+import bisect
 from datetime import datetime, timezone, timedelta
 
 HOME = os.path.expanduser("~")
@@ -38,16 +42,42 @@ _U7_MIN = datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp()
 _U7_MAX = datetime(2030, 12, 31, tzinfo=timezone.utc).timestamp()
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 
-# 免费/自有模型：不消耗 WorkBuddy 积分，积分归属时必须排除，否则会把积分错记到这些模型上。
-# 用户确认：deepseek-v4-flash（无 .1）是自有模型不计费；deepseek-v4.1-flash（带 .1）计费。
-# 如需扩展，在此集合追加（归一化后的模型名，不含 custom-local: 前缀）。
+# 不消耗 WorkBuddy 积分的「自配」模型，积分归因时跳过。
+# 只放用户确认过的项：deepseek-v4-flash（无 .1，走内网自配）不计费；
+# deepseek-v4.1-flash（带 .1，WorkBuddy 内置）计费，切勿混淆。
+# ⚠ WorkBuddy 内置模型名带 free/lite（hy4free / wb-lite / hy3 等）只是档位名，
+#   它们仍有自己的积分倍率、仍会消耗积分，**不能按名称推断为免费**。
+#   旧版把 hy4free / wb-lite 放进这里导致大量积分被错判为「未指定」，已修正。
 FREE_MODELS = {"deepseek-v4-flash"}
+
+# 模型名别名：本机 models.json 用连字符 id，API 响应返回带点号的名字，二者是同一模型。
+# 只合并有配置佐证的项，其余变体保留原名以免误并。
+MODEL_ALIASES = {
+    "deepseek-v4-1-flash": "deepseek-v4.1-flash",
+}
+
+# sessions.model 里的档位/模式别名，不是真实模型名。
+# 实测这些会话全部无 trace 覆盖，绝不能拿它们做积分模型归因。
+TIER_ALIASES = {"fast-model", "balanced-model", "deep-model", "auto", "default"}
 
 
 def _paid(m):
-    """返回计费模型名；若为免费模型或空则返回 None。"""
+    """返回计费模型名；自配免费模型、档位别名、空值一律返回 None。"""
     m = norm_model(m)
-    if m in FREE_MODELS or m == "未指定":
+    if not m or m in FREE_MODELS or m in TIER_ALIASES or m == "未指定":
+        return None
+    return m
+
+
+def _named_model(m):
+    """取一个可直接展示的名字：只排除空值，不排除免费模型，也不排除档位别名。
+
+    用户要求每笔积分都有名字、不能出现「未指定」。自配免费模型与档位别名
+    （fast-model 等）作为会话主模型时照样显示原名，由 src 标注这是兜底推断，
+    避免把无 trace 的老会话硬塞成「未指定」。
+    """
+    m = norm_model(m)
+    if not m or m == "未指定":
         return None
     return m
 
@@ -65,47 +95,68 @@ def decode_uuid7(key):
     return None
 
 
-def _model_at_time(gens, dt):
-    """在生成轮次列表 [(epoch, model)] 里找时间最接近 dt 的【计费】模型（6h 内）。
-    免费模型（FREE_MODELS）一律跳过，避免把积分错记到不计费的模型上。"""
+def build_model_index(all_gens):
+    """把全局 [(epoch, model, sessionId)] 按时间排序，返回 (gens, epochs) 供二分查找。"""
+    gens = sorted(all_gens, key=lambda x: x[0])
+    return gens, [g[0] for g in gens]
+
+
+def _model_at_time(index, dt, sid=None, window=60):
+    """在 ±window 秒的全局 generation 窗口里找产生这笔积分最可能的【计费】模型。
+
+    关键事实：本机 trace 里约 89% 的 generation **没有 sessionId**（只有少数
+    trace_start 事件带 sessionId），所以「只按同会话匹配」会大面积失败并产生
+    「未指定」。而 credit_json 的 UUIDv7 时间戳与该次 generation 的 startedAt
+    通常只差 1~6 秒，是更可靠的关联依据。
+    排序：同会话候选优先（有 sessionId 时），其次按时间差最小；免费模型与档位名跳过。
+    """
+    gens, eps = index
     if not gens:
         return None
-    target = dt.timestamp()
-    best, best_d = None, None
-    for epoch, m in gens:
-        if m in FREE_MODELS:
+    t = dt.timestamp()
+    lo = bisect.bisect_left(eps, t - window)
+    hi = bisect.bisect_right(eps, t + window)
+    best = None
+    for epoch, m, gsid in gens[lo:hi]:
+        mm = norm_model(m)
+        if not _paid(mm):
             continue
-        d = abs(epoch - target)
-        if best_d is None or d < best_d:
-            best_d, best = d, m
-    if best_d is not None and best_d <= 6 * 3600:
-        return best
-    return None
+        key = (0 if (sid and gsid and gsid == sid) else 1, abs(epoch - t))
+        if best is None or key < best[0]:
+            best = (key, mm)
+    return best[1] if best else None
 
 
 def norm_model(m):
-    """归一化模型名：去掉 custom-local: 前缀，统一空值。"""
+    """归一化模型名：去掉 custom-local: 前缀、合并有佐证的别名、统一空值。"""
     m = (m or "").strip()
     if not m:
         return "未指定"
     if m.startswith("custom-local:"):
         m = m.split(":", 1)[1]
-    return m
+    return MODEL_ALIASES.get(m, m)
 
 
-def load_credits(db_path, traces_by_session):
+def load_credits(db_path, traces_by_session, model_index):
     """WorkBuddy 积分：每个会话 credit_json 求和。
 
-    时间归属（核心修正）：credit_json 的键是 UUIDv7，前 12 hex = 该条目消费时刻的
-    毫秒时间戳，可精确到条目级。优先用它把每笔积分归入真实消费时间；旧格式随机ID
-    （解码越界/溢出）或没有可信时间的条目才回退。
+    时间归属：credit_json 键是 UUIDv7，前 12 hex = 消费时刻的毫秒时间戳，逐条归入真实
+    时刻；旧格式随机 ID 才回退 trace 加权摊分或 updated_at。
 
-    模型归因：sessions.model 只记"会话选的主模型"，实际请求可能被路由到其他模型。
-    因此按条目的 UUIDv7 时间匹配同会话最近的 trace 生成轮次（实际模型）；无匹配时
-    用会话 trace 的多数模型，再回退会话主模型。
+    模型归因（四级，按可靠性递减）：
+      L1 time-window     全局 generation 里 ±60s 窗口内最近的计费模型（同会话优先）
+      L2 trace-dominant  同会话 trace 里出现最多的计费模型
+      L3 session-model   sessions.model 的真实模型名
+      L3' tier-alias     会话只记了档位名（fast-model 等），仍显示原名而非「未指定」
+      L4 unattributed    连会话主模型都没有 -> "未指定"（本机实测为 0）
+    L1 是主路径：trace 里约 89% 的 generation 没有 sessionId，只按会话匹配必然
+    大面积落到「未指定」。WorkBuddy 内置模型（含 hy4free / wb-lite）都有名字、
+    都会消耗积分，不能按名称当作免费模型排除；档位别名不参与 L1 匹配。
 
-    回退路径（旧格式会话/无 trace）：沿用 trace token 加权摊分到各小时；无 trace 才
-    回退 updated_at。
+    每条记录带两个质量标记：
+      est = exact(键内真实时间) / approx(trace token 加权摊分) / unknown(只能归到同步时刻)
+      src = time-window / trace-dominant / session-model / tier-alias / unattributed
+    unknown 的积分只保证总额守恒，不代表当天真实消耗，报表必须显式提示。
     """
     if not os.path.exists(db_path):
         print("WARN: db 不存在:", db_path)
@@ -129,18 +180,32 @@ def load_credits(db_path, traces_by_session):
             key=lambda x: x[0])
 
     out = []
-    for r in rows:
-        credits = 0.0
-        if r["cj"]:
+
+    def _items(cj_text):
+        """把 credit_json 解析为 [(key, float_value)]，跳过非数值项，避免单条脏数据丢失整会话。"""
+        try:
+            raw = json.loads(cj_text or "{}")
+        except Exception:
+            return []
+        items = []
+        for k, v in raw.items():
             try:
-                credits = float(sum(json.loads(r["cj"]).values()))
-            except Exception:
-                credits = 0.0
+                items.append((k, float(v)))
+            except (TypeError, ValueError):
+                continue
+        return items
+
+    for r in rows:
+        items = _items(r["cj"])
+        credits = sum(v for _, v in items)
         if credits <= 0:
             continue
         sid = r["sid"]
-        model0 = _paid(r["model"]) or "未指定"
         title = (r["title"] or "(无标题)")
+        # L3 兜底：会话主模型名照原样可用；档位别名单独标 src=tier-alias 以便识别
+        model0 = _named_model(r["model"])
+        model0_src = ("tier-alias" if model0 and norm_model(model0) in TIER_ALIASES
+                      else "session-model" if model0 else None)
         gens = gens_by_session.get(sid) or []
         dom_model = None
         if gens:
@@ -154,33 +219,40 @@ def load_credits(db_path, traces_by_session):
 
         # 拆分：可信 UUIDv7 时间条目 vs 不可信（旧格式/溢出）条目
         valid, legacy_val = [], 0.0
-        try:
-            cj = json.loads(r["cj"])
-        except Exception:
-            cj = {}
-        for k, v in cj.items():
+        for k, v in items:
             dt = decode_uuid7(k)
             if dt is not None:
-                valid.append((dt, float(v)))
+                valid.append((dt, v))
             else:
-                legacy_val += float(v)
+                legacy_val += v
 
-        def emit(dt, model, value):
+        def emit(dt, model, value, est="exact", src="unattributed"):
             out.append({
                 "ts": dt.strftime("%Y-%m-%d %H:%M:%S"),
                 "d": dt.strftime("%Y-%m-%d"),
                 "h": dt.strftime("%Y-%m-%d %H:00"),
-                "model": _paid(model) or "未指定", "value": round(value, 4), "label": title,
+                "model": _named_model(model) or "未指定",
+                "value": round(value, 4),
+                "label": title,
+                "est": est,
+                "src": src,
             })
 
         if valid:
             for dt, v in valid:
-                emit(dt, _model_at_time(gens, dt) or dom_model or model0, v)
+                hit = _model_at_time(model_index, dt, sid)
+                model = hit or dom_model or model0 or "未指定"
+                src = ("time-window" if hit else
+                       "trace-dominant" if dom_model else
+                       model0_src or "unattributed")
+                emit(dt, model, v, "exact", src)
             if legacy_val > 0:
                 upd_dt = datetime.fromtimestamp((r["upd"] or 0) / 1000.0, tz=TZ)
-                emit(upd_dt, dom_model or model0, legacy_val)
+                model = dom_model or model0 or "未指定"
+                src = "trace-dominant" if dom_model else model0_src or "unattributed"
+                emit(upd_dt, model, legacy_val, "unknown", src)
         else:
-            # 旧格式会话：沿用 trace token 加权摊分（带 24h 时效守卫），无 trace 回退 updated_at
+            # 旧格式会话：所有键都无时间信息，只能摊分或压到同步时刻，一律标 approx/unknown
             traces = [t for t in (traces_by_session.get(sid) or []) if t.get("tok", 0) > 0]
             upd_s = (r["upd"] or 0) / 1000.0
             if traces and upd_s - max(t["epoch"] for t in traces) > 86400:
@@ -191,11 +263,13 @@ def load_credits(db_path, traces_by_session):
                     share = credits * (t["tok"] / wsum) if wsum > 0 else credits / len(traces)
                     out.append({
                         "ts": t["ts"], "d": t["d"], "h": t["h"],
-                        "model": _paid(t.get("model")) or model0,
+                        "model": _named_model(t.get("model")) or model0 or "未指定",
                         "value": round(share, 4), "label": title,
+                        "est": "approx", "src": "trace-dominant",
                     })
             else:
-                emit(datetime.fromtimestamp(upd_s, tz=TZ), model0, credits)
+                emit(datetime.fromtimestamp(upd_s, tz=TZ), model0 or "未指定", credits,
+                     "unknown", model0_src or "unattributed")
     out.sort(key=lambda x: x["ts"])
     return out
 
@@ -282,20 +356,22 @@ def _parse_jsonl(path):
 
 
 def scan_traces(traces_dir):
-    """扫描 traces 目录：返回 (token 记录列表, session_id -> trace 时间/权重 索引)。
+    """扫描 traces 目录：返回 (token 记录列表, session_id 索引, 全局模型时间索引)。
 
     兼容两种 trace 格式：
       - 旧版 trace_<id>.json（单对象 {trace, spans}，模型/token 在 trace.modelInfo）
       - 新版 trace_<id>.jsonl（事件流；模型/token 在 generation span 的 toolOutput）
-    token 记录用于 Token 指标；session 索引用于把会话积分按活跃时间摊分。
+    token 记录用于 Token 指标；session 索引用于会话内摊分；
+    全局模型时间索引用于按积分消费时刻就近匹配实际模型（不依赖 sessionId）。
     """
     if not os.path.isdir(traces_dir):
         print("WARN: traces 目录不存在:", traces_dir)
-        return [], {}
+        return [], {}, ([], [])
     files = glob.glob(os.path.join(traces_dir, "*", "*.json"))
     files += glob.glob(os.path.join(traces_dir, "*", "*.jsonl"))
     token_records = []
     by_session = {}
+    all_gens = []
     for f in files:
         try:
             if f.endswith(".jsonl"):
@@ -332,6 +408,7 @@ def scan_traces(traces_dir):
                     "ts": g_ts, "d": g_dd, "h": g_hh, "tok": float(g["total"]),
                     "model": g["model"], "epoch": g_epoch,
                 })
+            all_gens.append((g_epoch, g["model"], sid))
             token_records.append({
                 "ts": g_ts, "d": g_dd, "h": g_hh, "model": g["model"],
                 "value": round(g["total"], 2),
@@ -341,12 +418,16 @@ def scan_traces(traces_dir):
                 "label": label,
             })
     token_records.sort(key=lambda x: x["ts"])
-    return token_records, by_session
+    return token_records, by_session, build_model_index(all_gens)
 
 
 def build_html(credits, tokens, meta):
+    meta = dict(meta)
+    meta["freeModels"] = sorted(FREE_MODELS)
+    meta["aliases"] = MODEL_ALIASES
     data = {"meta": meta, "credits": credits, "tokens": tokens}
-    data_json = json.dumps(data, ensure_ascii=False)
+    # 防止会话标题里出现 </script> 提前闭合内联脚本（JS 字符串里 \/ 等价于 /）
+    data_json = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
 
     html = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -503,24 +584,30 @@ function fmt(v,isPts){ return isPts ? (+v).toLocaleString(undefined,{minimumFrac
 
 function topModel(recs,isPts){
   const m={}; recs.forEach(r=>m[r.model]=(m[r.model]||0)+r.value);
-  const k=Object.keys(m).sort((a,b)=>m[b]-m[a])[0];
+  // "未指定"不是模型，只排真实模型；其占比在卡片第二行单独披露
+  const k=Object.keys(m).filter(x=>x!=='未指定').sort((a,b)=>m[b]-m[a])[0];
   return k?`${k}（${fmt(m[k],isPts)}）`:'-';
 }
 
 function renderSummary(){
   const cRecs=applyFilter(DATA.credits), tRecs=applyFilter(DATA.tokens);
   const cTot=cRecs.reduce((a,r)=>a+r.value,0), tTot=tRecs.reduce((a,r)=>a+r.value,0);
+  const sumBy=(f)=>cRecs.filter(f).reduce((a,r)=>a+r.value,0);
+  const unknown=sumBy(r=>r.est==='unknown'), approx=sumBy(r=>r.est==='approx');
+  const traced=sumBy(r=>r.src==='time-window'), unattr=sumBy(r=>r.model==='未指定');
   document.getElementById('summary').innerHTML=`
     <div class="scard pts"><div class="st">WorkBuddy 积分（已消耗）</div><div class="sv">${fmt(cTot,true)}</div>
-      <div class="ss">最高模型：${topModel(cRecs,true)} · ${cRecs.length} 条会话</div></div>
+      <div class="ss">最高模型：${topModel(cRecs,true)} · ${cRecs.length} 条消费记录</div>
+      <div class="ss">时间不可考 ${fmt(unknown,true)} / 估算 ${fmt(approx,true)}；时间窗口归因 ${cTot?(traced/cTot*100).toFixed(1):0}%，未指定模型 ${fmt(unattr,true)}</div></div>
     <div class="scard tok"><div class="st">Token 消耗（输入+输出）</div><div class="sv">${fmt(tTot,false)}</div>
-      <div class="ss">最高模型：${topModel(tRecs,false)} · ${tRecs.length} 条 trace</div></div>`;
+      <div class="ss">最高模型：${topModel(tRecs,false)} · ${tRecs.length} 条 trace（仅本地留存期内）</div></div>`;
 }
 
 function renderKpis(agg,isPts){
   const unit = metric==='credits' ? '积分' : 'tokens';
-  const top = agg.models[0]||'-';
-  const topVal = agg.models[0]?agg.modelTotals[agg.models[0]]:0;
+  const named = agg.models.filter(x=>x!=='未指定');
+  const top = named[0]||'-';
+  const topVal = top!=='-'?agg.modelTotals[top]:0;
   const pct = agg.total?(topVal/agg.total*100).toFixed(1):'0';
   const span = agg.buckets.length?`${agg.buckets[0]} ~ ${agg.buckets[agg.buckets.length-1]}`:'-';
   const unitLbl = gran==='hour' ? '小时' : '天';
@@ -560,15 +647,17 @@ function renderRank(agg,isPts){
 
 function renderTable(recs,isPts){
   const tbl=document.getElementById('tbl');
+  const EST_LBL={exact:'精确',approx:'估算',unknown:'不可考'};
   const cols = metric==='credits'
-    ? [['ts','时间',''],['label','标题','title'],['model','模型',''],['value','积分','num']]
-    : [['ts','时间',''],['model','模型',''],['input','输入','num'],['output','输出','num'],['cached','缓存','num'],['value','合计','num']];
+    ? [['ts','时间',''],['label','标题','title'],['model','模型',''],['est','时间可信度',''],['value','积分','num']]
+    : [['ts','时间',''],['model','模型',''],['input','输入','num'],['output','输出','num'],['cached','其中缓存','num'],['value','合计','num']];
   tbl.querySelector('thead').innerHTML='<tr>'+cols.map(c=>`<th data-k="${c[0]}" class="${c[2]}">${c[1]}</th>`).join('')+'</tr>';
   const rows=[...recs].sort((a,b)=>{let va=a[sortKey],vb=b[sortKey];
     if(typeof va==='number'||typeof vb==='number'){va=+va||0;vb=+vb||0;}
     if(va<vb)return -1*sortDir;if(va>vb)return 1*sortDir;return 0;});
   const body=rows.map(r=>'<tr>'+cols.map(c=>{
     const k=c[0];let v=r[k];
+    if(k==='est')return `<td>${EST_LBL[v]||v}</td>`;
     if(k==='model')return `<td><span class="tag">${v}</span></td>`;
     if(k==='label')return `<td class="title" title="${String(v).replace(/"/g,'&quot;')}">${String(v).replace(/</g,'&lt;')}</td>`;
     if(['value','input','output','cached'].includes(k))return `<td class="num">${fmt(v,isPts)}</td>`;
@@ -590,8 +679,8 @@ function render(){
   document.getElementById('chartTitle').textContent =
     (gran==='hour' ? '每小时用量' : '每天用量') + '（按模型堆叠）';
   document.getElementById('hint').textContent = (isPts
-    ? '指标：WorkBuddy 积分（来自会话消耗记录）。每笔积分用 credit_json 键内的 UUIDv7 时间戳归入真实消费时刻，模型按该时刻匹配同会话最近的【计费】模型；免费/自有模型（如 deepseek-v4-flash）不计入、已排除；无匹配时归"未指定"。'
-    : '指标：Token 消耗（来自运行 trace，输入+输出，缓存单列）。按 trace 开始时刻归入对应时间桶。')
+    ? '指标：WorkBuddy 积分。键内 UUIDv7 时间戳归入真实消费时刻；模型按该时刻 ±60s 窗口内最近的计费 generation 匹配（同会话优先），无匹配依次回退会话多数模型、会话主模型名；档位别名不参与窗口匹配，仅在无 trace 的老会话作为兜底名字显示。自配不计费模型：'+META.freeModels.join('、')+'。内置模型名带 free/lite 仍计费。标记"不可考"的积分只保证总额，不代表当天真实消耗。'
+    : '指标：Token 消耗（运行 trace，输入+输出；"其中缓存"是输入的子集，不可与输入相加）。按 generation 开始时刻归桶。')
     + (gran==='hour' ? ' 当前粒度：小时。' : ' 当前粒度：天。');
   renderSummary();
   renderKpis(agg,isPts);
@@ -614,10 +703,12 @@ document.querySelectorAll('.tabs button').forEach(b=>{
 });
 
 document.getElementById('foot').innerHTML =
-  '口径说明：① WorkBuddy 积分 = 会话消耗记录(session_usage.credit_json)各项之和，单位积分(两位小数)；'
-  +'② Token 消耗 = 运行 trace 的输入+输出 token，缓存 token 单列展示；'
-  +  '③ 两者来源与粒度不同（积分按会话条目、Token 按 trace），仅供并列参考。本报表为本地只读分析，不修改原始数据。'
-  +'④ 口径：积分时间来自 credit_json 键内 UUIDv7 时间戳（精确到条目）；旧格式随机ID/无 trace 会话回退 trace 加权或最后同步时刻，可能高估同步当天。Token 来自本地 traces（JSON/JSONL 双格式）。';
+  '口径说明：① 积分 = session_usage.credit_json 各项之和（单位积分，两位小数），总额守恒；'
+  +'② Token = trace 的 total_tokens（= prompt + completion）；"其中缓存"是 prompt_tokens 的子集，单列展示、不重复计入合计；'
+  +'③ 积分时间：键内 UUIDv7 毫秒时间戳为"精确"；旧格式随机ID 只能按 trace token 加权"估算"或归到最后同步时刻"不可考"，后者不代表当天真实消耗；'
+  +'④ 模型归因：L1 全局 ±60s 时间窗口内最近的计费 generation（同会话优先）→ L2 会话多数模型 → L3 会话主模型名；trace 里约 89% 的 generation 无 sessionId，故不能只按会话匹配；内置模型名带 free/lite 仍计费，仅 '+META.freeModels.join('、')+' 为用户确认的自配不计费模型（可编辑 gen_report.py 的 FREE_MODELS）'
+  +'；档位别名（fast-model 等）只作老会话兜底名字显示，src=tier-alias；别名合并：'+Object.entries(META.aliases).map(([a,b])=>a+'→'+b).join('、')+'；'
+  +'⑤ traces 有保留期，Token 只覆盖本地留存期；积分与 Token 来源、粒度不同，仅供并列参考。本地只读分析，不修改原始数据。';
 
 render();
 </script>
@@ -647,9 +738,12 @@ def main():
 
     print("积分源:", db_path)
     print("Token 源:", traces_dir)
-    tokens, by_session = scan_traces(traces_dir)
-    credits = load_credits(db_path, by_session)
+    tokens, by_session, model_index = scan_traces(traces_dir)
+    credits = load_credits(db_path, by_session, model_index)
     print("积分记录:", len(credits), "合计:", round(sum(r['value'] for r in credits), 2))
+    print("  时间不可考:", round(sum(r['value'] for r in credits if r['est'] == 'unknown'), 2),
+          "估算:", round(sum(r['value'] for r in credits if r['est'] == 'approx'), 2),
+          "未指定模型:", round(sum(r['value'] for r in credits if r['model'] == '未指定'), 2))
     print("Token 记录:", len(tokens), "合计:", int(sum(r['value'] for r in tokens)))
 
     meta = {
